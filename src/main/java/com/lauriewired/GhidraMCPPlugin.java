@@ -44,6 +44,12 @@ import ghidra.program.model.listing.Variable;
 import ghidra.app.decompiler.component.DecompilerUtils;
 import ghidra.app.decompiler.ClangToken;
 import ghidra.framework.options.Options;
+import ghidra.program.model.block.BasicBlockModel;
+import ghidra.program.model.block.CodeBlock;
+import ghidra.program.model.block.CodeBlockIterator;
+import ghidra.program.model.block.CodeBlockReference;
+import ghidra.program.model.block.CodeBlockReferenceIterator;
+import ghidra.program.model.mem.Memory;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
@@ -339,6 +345,72 @@ public class GhidraMCPPlugin extends Plugin {
             int limit = parseIntOrDefault(qparams.get("limit"), 100);
             String filter = qparams.get("filter");
             sendResponse(exchange, listDefinedStrings(offset, limit, filter));
+        });
+
+        // ---- Search endpoints ----
+
+        server.createContext("/searchBytes", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            String pattern = qparams.get("pattern");
+            String start = qparams.get("start");
+            String end = qparams.get("end");
+            int limit = parseIntOrDefault(qparams.get("limit"), 100);
+            sendResponse(exchange, searchBytes(pattern, start, end, limit));
+        });
+
+        server.createContext("/searchInstructions", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            String pattern = qparams.get("pattern");
+            String funcAddress = qparams.get("func_address");
+            String start = qparams.get("start");
+            String end = qparams.get("end");
+            int limit = parseIntOrDefault(qparams.get("limit"), 100);
+            sendResponse(exchange, searchInstructions(pattern, funcAddress, start, end, limit));
+        });
+
+        server.createContext("/searchMemory", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            String value = qparams.get("value");
+            String type = qparams.get("type");
+            String start = qparams.get("start");
+            String end = qparams.get("end");
+            int limit = parseIntOrDefault(qparams.get("limit"), 100);
+            sendResponse(exchange, searchMemory(value, type, start, end, limit));
+        });
+
+        // ---- Control flow endpoints ----
+
+        server.createContext("/getBasicBlocks", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            String address = qparams.get("address");
+            sendResponse(exchange, getBasicBlocks(address));
+        });
+
+        server.createContext("/getControlFlowGraph", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            String address = qparams.get("address");
+            sendResponse(exchange, getControlFlowGraph(address));
+        });
+
+        server.createContext("/getDominatorTree", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            String address = qparams.get("address");
+            sendResponse(exchange, getDominatorTree(address));
+        });
+
+        // ---- Calling convention endpoints ----
+
+        server.createContext("/getCallingConvention", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            String address = qparams.get("address");
+            sendResponse(exchange, getCallingConvention(address));
+        });
+
+        server.createContext("/setCallingConvention", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            String address = params.get("address");
+            String convention = params.get("convention");
+            sendResponse(exchange, setCallingConvention(address, convention));
         });
 
         server.setExecutor(null);
@@ -1525,6 +1597,624 @@ public class GhidraMCPPlugin extends Plugin {
             }
         }
         return null;
+    }
+
+    // ==========================================================================
+    // Search methods
+    // ==========================================================================
+
+    private String searchBytes(String pattern, String startStr, String endStr, int limit) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (pattern == null || pattern.isEmpty()) return "Pattern is required";
+
+        try {
+            byte[] searchBytes = parseBytePattern(pattern);
+            byte[] maskBytes = parseByteMask(pattern);
+            if (searchBytes.length == 0) return "Invalid pattern";
+
+            Address startAddr = (startStr != null && !startStr.isEmpty())
+                ? program.getAddressFactory().getAddress(startStr) : null;
+            Address endAddr = (endStr != null && !endStr.isEmpty())
+                ? program.getAddressFactory().getAddress(endStr) : null;
+
+            Memory memory = program.getMemory();
+            List<String> results = new ArrayList<>();
+            ConsoleTaskMonitor monitor = new ConsoleTaskMonitor();
+
+            for (MemoryBlock block : memory.getBlocks()) {
+                if (results.size() >= limit) break;
+                if (!block.isLoaded()) continue;
+
+                Address searchStart = block.getStart();
+                Address searchEnd = block.getEnd();
+
+                if (startAddr != null) {
+                    if (startAddr.compareTo(searchEnd) > 0) continue;
+                    if (startAddr.compareTo(searchStart) > 0) searchStart = startAddr;
+                }
+                if (endAddr != null) {
+                    if (endAddr.compareTo(searchStart) < 0) continue;
+                    if (endAddr.compareTo(searchEnd) < 0) searchEnd = endAddr;
+                }
+
+                Address found = memory.findBytes(searchStart, searchEnd, searchBytes,
+                    maskBytes, true, monitor);
+                while (found != null && results.size() < limit) {
+                    results.add(found.toString());
+                    Address next = found.add(1);
+                    if (next.compareTo(searchEnd) > 0) break;
+                    found = memory.findBytes(next, searchEnd, searchBytes,
+                        maskBytes, true, monitor);
+                }
+            }
+            return results.isEmpty() ? "No matches found" : String.join("\n", results);
+        } catch (Exception e) {
+            return "Error searching bytes: " + e.getMessage();
+        }
+    }
+
+    private byte[] parseBytePattern(String pattern) {
+        byte[] out = new byte[parseByteMask(pattern).length];
+        String clean = pattern.replaceAll("\\s+", "").toUpperCase();
+        java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+        int i = 0;
+        while (i < clean.length()) {
+            if (clean.charAt(i) == '?') {
+                bos.write(0);
+                i++;
+                if (i < clean.length() && clean.charAt(i) == '?') i++;
+            } else {
+                if (i + 1 < clean.length()) {
+                    bos.write(Integer.parseInt(clean.substring(i, i + 2), 16));
+                    i += 2;
+                } else {
+                    break;
+                }
+            }
+        }
+        return bos.toByteArray();
+    }
+
+    private byte[] parseByteMask(String pattern) {
+        String clean = pattern.replaceAll("\\s+", "").toUpperCase();
+        java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+        int i = 0;
+        while (i < clean.length()) {
+            if (clean.charAt(i) == '?') {
+                bos.write(0);
+                i++;
+                if (i < clean.length() && clean.charAt(i) == '?') i++;
+            } else {
+                if (i + 1 < clean.length()) {
+                    bos.write(0xFF);
+                    i += 2;
+                } else {
+                    break;
+                }
+            }
+        }
+        return bos.toByteArray();
+    }
+
+    private String searchInstructions(String pattern, String funcAddressStr,
+                                       String startStr, String endStr, int limit) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (pattern == null || pattern.isEmpty()) return "Pattern is required";
+
+        try {
+            String[] mnemonics = pattern.split(";");
+            for (int i = 0; i < mnemonics.length; i++) {
+                mnemonics[i] = mnemonics[i].trim().toLowerCase();
+                if (mnemonics[i].isEmpty()) return "Invalid pattern: empty mnemonic";
+            }
+
+            Listing listing = program.getListing();
+            InstructionIterator it;
+
+            if (funcAddressStr != null && !funcAddressStr.isEmpty()) {
+                Address funcAddr = program.getAddressFactory().getAddress(funcAddressStr);
+                Function func = getFunctionForAddress(program, funcAddr);
+                if (func == null) return "No function at " + funcAddressStr;
+                it = listing.getInstructions(func.getBody(), true);
+            } else if (startStr != null && !startStr.isEmpty()) {
+                Address startAddr = program.getAddressFactory().getAddress(startStr);
+                it = listing.getInstructions(startAddr, true);
+            } else {
+                it = listing.getInstructions(true);
+            }
+
+            List<String> results = new ArrayList<>();
+            List<Instruction> window = new ArrayList<>(mnemonics.length);
+            String endStrVal = endStr;
+
+            while (it.hasNext() && results.size() < limit) {
+                Instruction instr = it.next();
+
+                if (endStrVal != null && !endStrVal.isEmpty()) {
+                    Address endAddr = program.getAddressFactory().getAddress(endStrVal);
+                    if (instr.getAddress().compareTo(endAddr) > 0) break;
+                }
+
+                window.add(instr);
+                if (window.size() > mnemonics.length) {
+                    window.remove(0);
+                }
+                if (window.size() == mnemonics.length) {
+                    boolean match = true;
+                    for (int i = 0; i < mnemonics.length; i++) {
+                        if (!window.get(i).getMnemonicString().toLowerCase()
+                                .equals(mnemonics[i])) {
+                            match = false;
+                            break;
+                        }
+                    }
+                    if (match) {
+                        results.add(window.get(0).getAddress().toString());
+                    }
+                }
+            }
+            return results.isEmpty() ? "No matches found" : String.join("\n", results);
+        } catch (Exception e) {
+            return "Error searching instructions: " + e.getMessage();
+        }
+    }
+
+    private String searchMemory(String valueStr, String type, String startStr,
+                                 String endStr, int limit) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (valueStr == null || valueStr.isEmpty()) return "Value is required";
+        if (type == null || type.isEmpty()) return "Type is required";
+
+        try {
+            int byteSize;
+            boolean isFloat;
+            boolean isSigned;
+            switch (type.toLowerCase()) {
+                case "int8":   byteSize = 1; isFloat = false; isSigned = true;  break;
+                case "uint8":  byteSize = 1; isFloat = false; isSigned = false; break;
+                case "int16":  byteSize = 2; isFloat = false; isSigned = true;  break;
+                case "uint16": byteSize = 2; isFloat = false; isSigned = false; break;
+                case "int32":  byteSize = 4; isFloat = false; isSigned = true;  break;
+                case "uint32":
+                case "ptr":    byteSize = 4; isFloat = false; isSigned = false; break;
+                case "int64":  byteSize = 8; isFloat = false; isSigned = true;  break;
+                case "uint64": byteSize = 8; isFloat = false; isSigned = false; break;
+                case "float32":
+                case "float":  byteSize = 4; isFloat = true;  isSigned = false; break;
+                case "float64":
+                case "double": byteSize = 8; isFloat = true;  isSigned = false; break;
+                default: return "Unknown type: " + type;
+            }
+
+            long longValue = 0;
+            double doubleValue = 0;
+            if (isFloat) {
+                doubleValue = Double.parseDouble(valueStr);
+            } else {
+                String v = valueStr.toLowerCase();
+                if (v.startsWith("0x")) {
+                    longValue = Long.parseUnsignedLong(v.substring(2), 16);
+                } else {
+                    longValue = Long.parseLong(v);
+                }
+            }
+
+            Address startAddr = (startStr != null && !startStr.isEmpty())
+                ? program.getAddressFactory().getAddress(startStr) : null;
+            Address endAddr = (endStr != null && !endStr.isEmpty())
+                ? program.getAddressFactory().getAddress(endStr) : null;
+
+            Memory memory = program.getMemory();
+            List<String> results = new ArrayList<>();
+
+            for (MemoryBlock block : memory.getBlocks()) {
+                if (results.size() >= limit) break;
+                if (!block.isLoaded()) continue;
+
+                Address blockStart = block.getStart();
+                Address blockEnd = block.getEnd();
+                if (startAddr != null && startAddr.compareTo(blockStart) > 0)
+                    blockStart = startAddr;
+                if (endAddr != null && endAddr.compareTo(blockEnd) < 0)
+                    blockEnd = endAddr;
+
+                byte[] buffer = new byte[byteSize];
+                for (Address addr = blockStart;
+                     addr.compareTo(blockEnd) <= 0 && results.size() < limit;
+                     addr = addr.add(1)) {
+                    if (block.getBytes(addr, buffer, 0, byteSize) < byteSize)
+                        continue;
+
+                    boolean match;
+                    if (isFloat && byteSize == 4) {
+                        float f = java.nio.ByteBuffer.wrap(buffer)
+                            .order(java.nio.ByteOrder.LITTLE_ENDIAN).getFloat();
+                        match = (Math.abs(f - (float) doubleValue) < 0.0001f);
+                    } else if (isFloat && byteSize == 8) {
+                        double d = java.nio.ByteBuffer.wrap(buffer)
+                            .order(java.nio.ByteOrder.LITTLE_ENDIAN).getDouble();
+                        match = (Math.abs(d - doubleValue) < 0.0001);
+                    } else if (isSigned) {
+                        long val = 0;
+                        for (int j = 0; j < byteSize; j++)
+                            val |= (buffer[j] & 0xFFL) << (8 * j);
+                        if ((val & (1L << (byteSize * 8 - 1))) != 0) {
+                            long mask = (1L << (byteSize * 8)) - 1;
+                            val = val | ~mask;
+                        }
+                        match = (val == longValue);
+                    } else {
+                        long val = 0;
+                        for (int j = 0; j < byteSize; j++)
+                            val |= (buffer[j] & 0xFFL) << (8 * j);
+                        long mask = (1L << (byteSize * 8)) - 1;
+                        match = ((val & mask) == (longValue & mask));
+                    }
+
+                    if (match) {
+                        results.add(String.format("%s: %s", addr.toString(),
+                            formatMemoryValue(buffer, isFloat, byteSize)));
+                    }
+                }
+            }
+            return results.isEmpty() ? "No matches found" : String.join("\n", results);
+        } catch (Exception e) {
+            return "Error searching memory: " + e.getMessage();
+        }
+    }
+
+    private String formatMemoryValue(byte[] buf, boolean isFloat, int size) {
+        if (isFloat && size == 4) {
+            float f = java.nio.ByteBuffer.wrap(buf)
+                .order(java.nio.ByteOrder.LITTLE_ENDIAN).getFloat();
+            return Float.toString(f);
+        }
+        if (isFloat && size == 8) {
+            double d = java.nio.ByteBuffer.wrap(buf)
+                .order(java.nio.ByteOrder.LITTLE_ENDIAN).getDouble();
+            return Double.toString(d);
+        }
+        long val = 0;
+        for (int i = 0; i < size; i++)
+            val |= (buf[i] & 0xFFL) << (8 * i);
+        return String.format("0x%X", val);
+    }
+
+    // ==========================================================================
+    // Control flow methods
+    // ==========================================================================
+
+    private String getBasicBlocks(String addressStr) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) return "Address is required";
+
+        try {
+            Address addr = program.getAddressFactory().getAddress(addressStr);
+            Function func = getFunctionForAddress(program, addr);
+            if (func == null) return "No function at " + addressStr;
+
+            BasicBlockModel bbm = new BasicBlockModel(program);
+            ConsoleTaskMonitor monitor = new ConsoleTaskMonitor();
+            CodeBlockIterator it = bbm.getCodeBlocksContaining(func.getBody(), monitor);
+
+            Listing listing = program.getListing();
+            List<String> lines = new ArrayList<>();
+            while (it.hasNext()) {
+                CodeBlock block = it.next();
+                int instrCount = 0;
+                InstructionIterator ii = listing.getInstructions(block.getMinAddress(), true);
+                while (ii.hasNext()) {
+                    Instruction instr = ii.next();
+                    if (instr.getAddress().compareTo(block.getMaxAddress()) > 0) break;
+                    instrCount++;
+                }
+
+                CodeBlockReferenceIterator refs = block.getDestinations(monitor);
+                List<String> succs = new ArrayList<>();
+                while (refs.hasNext()) {
+                    CodeBlockReference ref = refs.next();
+                    succs.add(String.format("%s(%s)",
+                        ref.getDestinationBlock().getMinAddress(),
+                        ref.getFlowType().getName()));
+                }
+
+                lines.add(String.format("BB[%s]: %s - %s, %d instrs -> [%s]",
+                    block.getMinAddress(), block.getMinAddress(),
+                    block.getMaxAddress(), instrCount, String.join(", ", succs)));
+            }
+            return String.join("\n", lines);
+        } catch (Exception e) {
+            return "Error getting basic blocks: " + e.getMessage();
+        }
+    }
+
+    private String getControlFlowGraph(String addressStr) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) return "Address is required";
+
+        try {
+            Address addr = program.getAddressFactory().getAddress(addressStr);
+            Function func = getFunctionForAddress(program, addr);
+            if (func == null) return "No function at " + addressStr;
+
+            BasicBlockModel bbm = new BasicBlockModel(program);
+            ConsoleTaskMonitor monitor = new ConsoleTaskMonitor();
+            CodeBlockIterator it = bbm.getCodeBlocksContaining(func.getBody(), monitor);
+
+            Map<String, Integer> addrToId = new LinkedHashMap<>();
+            List<CodeBlock> blocks = new ArrayList<>();
+            while (it.hasNext()) {
+                CodeBlock block = it.next();
+                addrToId.put(block.getMinAddress().toString(), blocks.size());
+                blocks.add(block);
+            }
+
+            StringBuilder sb = new StringBuilder();
+            sb.append("=== NODES ===\n");
+            for (int i = 0; i < blocks.size(); i++) {
+                CodeBlock block = blocks.get(i);
+                sb.append(String.format("%d: %s (entry:%s, type:%s)\n", i,
+                    block.getMinAddress(), block.getMinAddress(),
+                    block.getFlowType().getName()));
+            }
+
+            sb.append("\n=== EDGES ===\n");
+            for (int i = 0; i < blocks.size(); i++) {
+                CodeBlock block = blocks.get(i);
+                CodeBlockReferenceIterator refs = block.getDestinations(monitor);
+                while (refs.hasNext()) {
+                    CodeBlockReference ref = refs.next();
+                    Integer toId = addrToId.get(
+                        ref.getDestinationBlock().getMinAddress().toString());
+                    if (toId != null) {
+                        sb.append(String.format("%d -> %d: %s\n", i, toId,
+                            ref.getFlowType().getName()));
+                    }
+                }
+            }
+            return sb.toString();
+        } catch (Exception e) {
+            return "Error getting control flow graph: " + e.getMessage();
+        }
+    }
+
+    private String getDominatorTree(String addressStr) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) return "Address is required";
+
+        try {
+            Address addr = program.getAddressFactory().getAddress(addressStr);
+            Function func = getFunctionForAddress(program, addr);
+            if (func == null) return "No function at " + addressStr;
+
+            BasicBlockModel bbm = new BasicBlockModel(program);
+            ConsoleTaskMonitor monitor = new ConsoleTaskMonitor();
+            CodeBlockIterator it = bbm.getCodeBlocksContaining(func.getBody(), monitor);
+
+            List<CodeBlock> blocks = new ArrayList<>();
+            Map<String, Integer> addrToIdx = new LinkedHashMap<>();
+            while (it.hasNext()) {
+                CodeBlock block = it.next();
+                addrToIdx.put(block.getMinAddress().toString(), blocks.size());
+                blocks.add(block);
+            }
+
+            int n = blocks.size();
+            if (n == 0) return "No basic blocks found";
+            if (n == 1) {
+                return String.format("Single block: %s, idom=self",
+                    blocks.get(0).getMinAddress());
+            }
+
+            List<List<Integer>> succs = new ArrayList<>(n);
+            List<List<Integer>> preds = new ArrayList<>(n);
+            for (int i = 0; i < n; i++) {
+                succs.add(new ArrayList<>());
+                preds.add(new ArrayList<>());
+            }
+
+            for (int i = 0; i < n; i++) {
+                CodeBlock block = blocks.get(i);
+                CodeBlockReferenceIterator refs = block.getDestinations(monitor);
+                while (refs.hasNext()) {
+                    CodeBlockReference ref = refs.next();
+                    Integer toIdx = addrToIdx.get(
+                        ref.getDestinationBlock().getMinAddress().toString());
+                    if (toIdx != null && toIdx != i) {
+                        succs.get(i).add(toIdx);
+                        preds.get(toIdx).add(i);
+                    }
+                }
+            }
+
+            // Entry block = first block in address order
+            int entryIdx = 0;
+            for (int i = 1; i < n; i++) {
+                if (blocks.get(i).getMinAddress()
+                        .compareTo(blocks.get(entryIdx).getMinAddress()) < 0) {
+                    entryIdx = i;
+                }
+            }
+
+            // DFS to compute reverse postorder
+            List<Integer> rpo = new ArrayList<>();
+            boolean[] visited = new boolean[n];
+            dfsPostorder(entryIdx, succs, visited, rpo);
+            java.util.Collections.reverse(rpo);
+
+            // RPO position for intersect comparison
+            int[] rpoPos = new int[n];
+            for (int i = 0; i < rpo.size(); i++) {
+                rpoPos[rpo.get(i)] = i;
+            }
+
+            // Cooper-Harvey-Kennedy
+            int[] idom = new int[n];
+            java.util.Arrays.fill(idom, -1);
+            idom[entryIdx] = entryIdx;
+
+            boolean changed = true;
+            while (changed) {
+                changed = false;
+                for (int idx : rpo) {
+                    if (idx == entryIdx) continue;
+
+                    int newIdom = -1;
+                    for (int pred : preds.get(idx)) {
+                        if (idom[pred] != -1) {
+                            newIdom = pred;
+                            break;
+                        }
+                    }
+                    if (newIdom == -1) continue;
+
+                    for (int pred : preds.get(idx)) {
+                        if (pred == newIdom || idom[pred] == -1) continue;
+                        newIdom = chkIntersect(pred, newIdom, idom, rpoPos);
+                    }
+
+                    if (idom[idx] != newIdom) {
+                        idom[idx] = newIdom;
+                        changed = true;
+                    }
+                }
+            }
+
+            // Build dominated-by map
+            List<List<Integer>> children = new ArrayList<>(n);
+            for (int i = 0; i < n; i++) children.add(new ArrayList<>());
+            for (int i = 0; i < n; i++) {
+                if (i != entryIdx && idom[i] >= 0) {
+                    children.get(idom[i]).add(i);
+                }
+            }
+
+            // Compute dominance frontier
+            List<List<Integer>> frontier = new ArrayList<>(n);
+            for (int i = 0; i < n; i++) frontier.add(new ArrayList<>());
+
+            for (int b = 0; b < n; b++) {
+                List<Integer> bPreds = preds.get(b);
+                if (bPreds.size() >= 2) {
+                    for (int p : bPreds) {
+                        int runner = p;
+                        while (runner != idom[b] && runner >= 0) {
+                            if (!frontier.get(runner).contains(b)) {
+                                frontier.get(runner).add(b);
+                            }
+                            runner = idom[runner];
+                        }
+                    }
+                }
+            }
+
+            StringBuilder sb = new StringBuilder();
+            for (int i = 0; i < n; i++) {
+                String idomStr = (i == entryIdx) ? "self"
+                    : blocks.get(idom[i]).getMinAddress().toString();
+                List<String> childAddrs = new ArrayList<>();
+                for (int c : children.get(i)) {
+                    childAddrs.add(blocks.get(c).getMinAddress().toString());
+                }
+                List<String> frontierAddrs = new ArrayList<>();
+                for (int f : frontier.get(i)) {
+                    frontierAddrs.add(blocks.get(f).getMinAddress().toString());
+                }
+                sb.append(String.format("%s: idom=%s, dominates=[%s], frontier=[%s]",
+                    blocks.get(i).getMinAddress(), idomStr,
+                    String.join(", ", childAddrs),
+                    String.join(", ", frontierAddrs)));
+                if (i < n - 1) sb.append("\n");
+            }
+            return sb.toString();
+        } catch (Exception e) {
+            return "Error computing dominator tree: " + e.getMessage();
+        }
+    }
+
+    private void dfsPostorder(int node, List<List<Integer>> succs,
+                               boolean[] visited, List<Integer> result) {
+        visited[node] = true;
+        for (int next : succs.get(node)) {
+            if (!visited[next]) {
+                dfsPostorder(next, succs, visited, result);
+            }
+        }
+        result.add(node);
+    }
+
+    private int chkIntersect(int b1, int b2, int[] idom, int[] rpoPos) {
+        while (b1 != b2) {
+            while (rpoPos[b1] < rpoPos[b2]) b1 = idom[b1];
+            while (rpoPos[b2] < rpoPos[b1]) b2 = idom[b2];
+        }
+        return b1;
+    }
+
+    // ==========================================================================
+    // Calling convention methods
+    // ==========================================================================
+
+    private String getCallingConvention(String addressStr) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) return "Address is required";
+
+        try {
+            Address addr = program.getAddressFactory().getAddress(addressStr);
+            Function func = getFunctionForAddress(program, addr);
+            if (func == null) return "No function at " + addressStr;
+
+            return String.format("Function: %s\nCalling convention: %s\nPrototype: %s",
+                func.getName(),
+                func.getCallingConventionName(),
+                func.getPrototypeString(false, true));
+        } catch (Exception e) {
+            return "Error getting calling convention: " + e.getMessage();
+        }
+    }
+
+    private String setCallingConvention(String addressStr, String convention) {
+        Program program = getCurrentProgram();
+        if (program == null) return "No program loaded";
+        if (addressStr == null || addressStr.isEmpty()) return "Address is required";
+        if (convention == null || convention.isEmpty()) return "Convention is required";
+
+        try {
+            Address addr = program.getAddressFactory().getAddress(addressStr);
+            Function func = getFunctionForAddress(program, addr);
+            if (func == null) return "No function at " + addressStr;
+
+            java.util.concurrent.atomic.AtomicBoolean success =
+                new java.util.concurrent.atomic.AtomicBoolean(false);
+            java.util.concurrent.atomic.AtomicReference<String> errorMsg =
+                new java.util.concurrent.atomic.AtomicReference<>("");
+
+            SwingUtilities.invokeAndWait(() -> {
+                int tx = program.startTransaction("Set calling convention");
+                try {
+                    func.setCallingConvention(convention);
+                    success.set(true);
+                } catch (Exception e) {
+                    errorMsg.set(e.getMessage());
+                    Msg.error(this, "Error setting calling convention", e);
+                } finally {
+                    program.endTransaction(tx, success.get());
+                }
+            });
+
+            return success.get()
+                ? String.format("Calling convention set to \"%s\"", convention)
+                : String.format("Failed to set calling convention: %s", errorMsg.get());
+        } catch (Exception e) {
+            return "Error setting calling convention: " + e.getMessage();
+        }
     }
 
     // ----------------------------------------------------------------------------------

@@ -52,3 +52,6 @@ replay_pid*
 # Third party JAR files from Ghidra
 lib/*.jar
 
+# 自定义
+docs
+

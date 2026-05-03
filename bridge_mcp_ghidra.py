@@ -287,6 +287,149 @@ def list_strings(offset: int = 0, limit: int = 2000, filter: str = None) -> list
         params["filter"] = filter
     return safe_get("strings", params)
 
+# ---- Search tools ----
+
+@mcp.tool()
+def search_bytes(pattern: str, start: str = None, end: str = None, limit: int = 100) -> list:
+    """
+    Search for a byte pattern in memory.
+
+    Pattern supports hex bytes with optional wildcards (? or ??).
+    Examples: "DEADBEEF", "DE ?? BE EF", "DEAD??EF", "? ? CC"
+
+    Args:
+        pattern: Hex byte pattern to search for
+        start: Optional start address (hex string)
+        end: Optional end address (hex string)
+        limit: Maximum results (default: 100)
+    """
+    params = {"pattern": pattern, "limit": limit}
+    if start:
+        params["start"] = start
+    if end:
+        params["end"] = end
+    return safe_get("searchBytes", params)
+
+@mcp.tool()
+def search_instructions(pattern: str, func_address: str = None,
+                         start: str = None, end: str = None, limit: int = 100) -> list:
+    """
+    Search for a sequence of instruction mnemonics.
+
+    Pattern uses semicolon-separated mnemonics.
+    Example: "push; mov; call" matches push followed by mov followed by call
+
+    Args:
+        pattern: Semicolon-separated instruction mnemonics
+        func_address: Optional function address to restrict search
+        start: Optional start address (hex string)
+        end: Optional end address (hex string)
+        limit: Maximum results (default: 100)
+    """
+    params = {"pattern": pattern, "limit": limit}
+    if func_address:
+        params["func_address"] = func_address
+    if start:
+        params["start"] = start
+    if end:
+        params["end"] = end
+    return safe_get("searchInstructions", params)
+
+@mcp.tool()
+def search_memory(value: str, type: str, start: str = None, end: str = None,
+                   limit: int = 100) -> list:
+    """
+    Search memory for a value of a specific type.
+
+    Supports integer types (int8-64, uint8-64), float types (float32, float64),
+    and pointer type (ptr).
+
+    Args:
+        value: Value to search for (decimal or hex with 0x prefix)
+        type: Type to interpret as (int8/16/32/64, uint8/16/32/64, float32/64, ptr)
+        start: Optional start address (hex string)
+        end: Optional end address (hex string)
+        limit: Maximum results (default: 100)
+    """
+    params = {"value": value, "type": type, "limit": limit}
+    if start:
+        params["start"] = start
+    if end:
+        params["end"] = end
+    return safe_get("searchMemory", params)
+
+# ---- Control flow tools ----
+
+@mcp.tool()
+def get_basic_blocks(address: str) -> list:
+    """
+    Get basic block decomposition for a function.
+
+    Returns each basic block with its address range, instruction count,
+    and successor blocks with flow types.
+
+    Args:
+        address: Function address in hex format
+    """
+    return safe_get("getBasicBlocks", {"address": address})
+
+@mcp.tool()
+def get_control_flow_graph(address: str) -> list:
+    """
+    Get the control flow graph for a function.
+
+    Returns nodes (basic blocks with IDs) and edges (control flow transfers
+    with types: FALL_THROUGH, CONDITIONAL_JUMP, UNCONDITIONAL_JUMP, CALL, etc.)
+
+    Args:
+        address: Function address in hex format
+    """
+    return safe_get("getControlFlowGraph", {"address": address})
+
+@mcp.tool()
+def get_dominator_tree(address: str) -> list:
+    """
+    Get the dominator tree for a function.
+
+    Returns each basic block with its immediate dominator, dominated children,
+    and dominance frontier. Essential for OLLVM dispatcher identification.
+
+    Args:
+        address: Function address in hex format
+    """
+    return safe_get("getDominatorTree", {"address": address})
+
+# ---- Calling convention tools ----
+
+@mcp.tool()
+def get_calling_convention(address: str) -> list:
+    """
+    Get the calling convention of a function.
+
+    Returns the convention name (e.g. __stdcall, __fastcall, default)
+    and the full prototype with calling convention.
+
+    Args:
+        address: Function address in hex format
+    """
+    return safe_get("getCallingConvention", {"address": address})
+
+@mcp.tool()
+def set_calling_convention(address: str, convention: str) -> str:
+    """
+    Set the calling convention for a function.
+
+    Common conventions: __cdecl, __stdcall, __fastcall, __thiscall,
+    __vectorcall, default (ARM64), register (ARM32)
+
+    Args:
+        address: Function address in hex format
+        convention: Calling convention name
+    """
+    return safe_post("setCallingConvention",
+                      {"address": address, "convention": convention})
+
+
 def main():
     parser = argparse.ArgumentParser(description="MCP server for Ghidra")
     parser.add_argument("--ghidra-server", type=str, default=DEFAULT_GHIDRA_SERVER,
