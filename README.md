@@ -13,7 +13,6 @@ ghidraMCP is an Model Context Protocol server for allowing LLMs to autonomously 
 
 https://github.com/user-attachments/assets/36080514-f227-44bd-af84-78e29ee1d7f9
 
-
 # Features
 MCP Server + Ghidra Plugin
 
