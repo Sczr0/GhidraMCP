@@ -54,4 +54,6 @@ lib/*.jar
 
 # 自定义
 docs
+.spec-workflow
+
 
