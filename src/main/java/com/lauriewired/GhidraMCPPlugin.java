@@ -55,10 +55,8 @@ import ghidra.program.model.mem.Memory;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 
-import javax.swing.SwingUtilities;
 import java.io.IOException;
 import java.io.OutputStream;
-import java.lang.reflect.InvocationTargetException;
 import java.net.InetSocketAddress;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
@@ -77,9 +75,22 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class GhidraMCPPlugin extends Plugin {
 
     private HttpServer server;
+    private ExecutorService httpExecutor;
     private static final String OPTION_CATEGORY_NAME = "GhidraMCP HTTP Server";
     private static final String PORT_OPTION_NAME = "Server Port";
     private static final int DEFAULT_PORT = 8080;
+    private static final String DECOMPILE_TIMEOUT_OPTION_NAME = "Decompile Timeout (seconds)";
+    private static final int DEFAULT_DECOMPILE_TIMEOUT = 60;
+    /**
+     * Per-call timeout (seconds) passed to {@code DecompInterface.decompileFunction}.
+     *
+     * Tool Options 决定启动时的初值；运行时可通过 /setDecompileTimeout 端点动态调整
+     * （对应 Python 端 set_decompile_timeout MCP 工具）。volatile 保证多线程可见性。
+     *
+     * 注意：HTTP 客户端的请求超时（Python 端 http_timeout）必须 ≥ 此值 + 网络/序列化余量，
+     * 否则会先在客户端超时。
+     */
+    private volatile int decompileTimeoutSeconds = DEFAULT_DECOMPILE_TIMEOUT;
 
     public GhidraMCPPlugin(PluginTool tool) {
         super(tool);
@@ -91,6 +102,12 @@ public class GhidraMCPPlugin extends Plugin {
             null, // No help location for now
             "The network port number the embedded HTTP server will listen on. " +
             "Requires Ghidra restart or plugin reload to take effect after changing.");
+        options.registerOption(DECOMPILE_TIMEOUT_OPTION_NAME, DEFAULT_DECOMPILE_TIMEOUT,
+            null,
+            "Default timeout (seconds) passed to the Ghidra decompiler for each function. " +
+            "Increase this for very large or heavily obfuscated functions. " +
+            "This sets the initial value at plugin startup; the LLM can override it at runtime " +
+            "via the set_decompile_timeout MCP tool without restarting.");
 
         try {
             startServer();
@@ -105,6 +122,11 @@ public class GhidraMCPPlugin extends Plugin {
         // Read the configured port
         Options options = tool.getOptions(OPTION_CATEGORY_NAME);
         int port = options.getInt(PORT_OPTION_NAME, DEFAULT_PORT);
+        // 启动时读取反编译超时初值；运行时可通过 /setDecompileTimeout 覆盖。
+        int initialDecompileTimeout = options.getInt(DECOMPILE_TIMEOUT_OPTION_NAME, DEFAULT_DECOMPILE_TIMEOUT);
+        if (initialDecompileTimeout > 0) {
+            decompileTimeoutSeconds = initialDecompileTimeout;
+        }
 
         // Stop existing server if running (e.g., if plugin is reloaded)
         if (server != null) {
@@ -416,9 +438,22 @@ public class GhidraMCPPlugin extends Plugin {
             sendResponse(exchange, setCallingConvention(address, convention));
         });
 
+        // ---- Runtime configuration endpoints ----
+
+        server.createContext("/getDecompileTimeout", exchange -> {
+            sendResponse(exchange, String.valueOf(decompileTimeoutSeconds));
+        });
+
+        server.createContext("/setDecompileTimeout", exchange -> {
+            Map<String, String> params = parsePostParams(exchange);
+            sendResponse(exchange, setDecompileTimeoutSeconds(params.get("seconds")));
+        });
+
         // 用 4 线程池替代默认单线程 executor，避免一个慢请求（反编译/CFG/支配树）阻塞所有后续 MCP 调用。
-        // 写操作仍然走 startTransaction / SwingUtilities.invokeAndWait，事务串行性由 Ghidra 自身保证。
-        server.setExecutor(Executors.newFixedThreadPool(4));
+        // 写操作的事务由 Ghidra DomainObject 自身的锁保证串行性，无需 EDT。
+        // executor 提取到字段，dispose() 时 shutdownNow，避免 plugin reload 时线程泄漏。
+        httpExecutor = Executors.newFixedThreadPool(4);
+        server.setExecutor(httpExecutor);
         // HttpServer.start() 是非阻塞的，内部会派生 daemon 监听线程；
         // 端口冲突等 IOException 已在前面的 HttpServer.create() 抛出，
         // 由 startServer() throws + 构造器 catch 统一处理，无需额外包装线程。
@@ -569,18 +604,17 @@ public class GhidraMCPPlugin extends Plugin {
         DecompInterface decomp = new DecompInterface();
         try {
             decomp.openProgram(program);
-            for (Function func : program.getFunctionManager().getFunctions(true)) {
-                if (func.getName().equals(name)) {
-                    DecompileResults result =
-                        decomp.decompileFunction(func, 30, new ConsoleTaskMonitor());
-                    if (result != null && result.decompileCompleted()) {
-                        return result.getDecompiledFunction().getC();
-                    } else {
-                        return "Decompilation failed";
-                    }
-                }
+            Function func = findFunctionByName(program, name);
+            if (func == null) {
+                return "Function not found";
             }
-            return "Function not found";
+            DecompileResults result =
+                decomp.decompileFunction(func, decompileTimeoutSeconds, new ConsoleTaskMonitor());
+            if (result != null && result.decompileCompleted()) {
+                return result.getDecompiledFunction().getC();
+            } else {
+                return "Decompilation failed";
+            }
         } finally {
             decomp.dispose();
         }
@@ -591,28 +625,21 @@ public class GhidraMCPPlugin extends Plugin {
         if (program == null) return false;
 
         AtomicBoolean successFlag = new AtomicBoolean(false);
+        // 事务在工作线程上直接执行：DomainObject 内部有锁保证串行性，无需 EDT。
+        // 走 EDT 只会让 UI 卡顿 + HTTP 线程同步等。
+        int tx = program.startTransaction("Rename function via HTTP");
         try {
-            SwingUtilities.invokeAndWait(() -> {
-                int tx = program.startTransaction("Rename function via HTTP");
-                try {
-                    for (Function func : program.getFunctionManager().getFunctions(true)) {
-                        if (func.getName().equals(oldName)) {
-                            func.setName(newName, SourceType.USER_DEFINED);
-                            successFlag.set(true);
-                            break;
-                        }
-                    }
-                }
-                catch (Exception e) {
-                    Msg.error(this, "Error renaming function", e);
-                }
-                finally {
-                    successFlag.set(program.endTransaction(tx, successFlag.get()));
-                }
-            });
+            Function func = findFunctionByName(program, oldName);
+            if (func != null) {
+                func.setName(newName, SourceType.USER_DEFINED);
+                successFlag.set(true);
+            }
         }
-        catch (InterruptedException | InvocationTargetException e) {
-            Msg.error(this, "Failed to execute rename on Swing thread", e);
+        catch (Exception e) {
+            Msg.error(this, "Error renaming function", e);
+        }
+        finally {
+            successFlag.set(program.endTransaction(tx, successFlag.get()));
         }
         return successFlag.get();
     }
@@ -621,33 +648,27 @@ public class GhidraMCPPlugin extends Plugin {
         Program program = getCurrentProgram();
         if (program == null) return;
 
+        // 事务在工作线程直接执行，无需 EDT（详见 renameFunction 注释）。
+        int tx = program.startTransaction("Rename data");
         try {
-            SwingUtilities.invokeAndWait(() -> {
-                int tx = program.startTransaction("Rename data");
-                try {
-                    Address addr = program.getAddressFactory().getAddress(addressStr);
-                    Listing listing = program.getListing();
-                    Data data = listing.getDefinedDataAt(addr);
-                    if (data != null) {
-                        SymbolTable symTable = program.getSymbolTable();
-                        Symbol symbol = symTable.getPrimarySymbol(addr);
-                        if (symbol != null) {
-                            symbol.setName(newName, SourceType.USER_DEFINED);
-                        } else {
-                            symTable.createLabel(addr, newName, SourceType.USER_DEFINED);
-                        }
-                    }
+            Address addr = program.getAddressFactory().getAddress(addressStr);
+            Listing listing = program.getListing();
+            Data data = listing.getDefinedDataAt(addr);
+            if (data != null) {
+                SymbolTable symTable = program.getSymbolTable();
+                Symbol symbol = symTable.getPrimarySymbol(addr);
+                if (symbol != null) {
+                    symbol.setName(newName, SourceType.USER_DEFINED);
+                } else {
+                    symTable.createLabel(addr, newName, SourceType.USER_DEFINED);
                 }
-                catch (Exception e) {
-                    Msg.error(this, "Rename data error", e);
-                }
-                finally {
-                    program.endTransaction(tx, true);
-                }
-            });
+            }
         }
-        catch (InterruptedException | InvocationTargetException e) {
-            Msg.error(this, "Failed to execute rename data on Swing thread", e);
+        catch (Exception e) {
+            Msg.error(this, "Rename data error", e);
+        }
+        finally {
+            program.endTransaction(tx, true);
         }
     }
 
@@ -659,19 +680,13 @@ public class GhidraMCPPlugin extends Plugin {
         try {
             decomp.openProgram(program);
 
-            Function func = null;
-            for (Function f : program.getFunctionManager().getFunctions(true)) {
-                if (f.getName().equals(functionName)) {
-                    func = f;
-                    break;
-                }
-            }
+            Function func = findFunctionByName(program, functionName);
 
             if (func == null) {
                 return "Function not found";
             }
 
-            DecompileResults result = decomp.decompileFunction(func, 30, new ConsoleTaskMonitor());
+            DecompileResults result = decomp.decompileFunction(func, decompileTimeoutSeconds, new ConsoleTaskMonitor());
             if (result == null || !result.decompileCompleted()) {
                 return "Decompilation failed";
             }
@@ -706,38 +721,28 @@ public class GhidraMCPPlugin extends Plugin {
 
             boolean commitRequired = checkFullCommit(highSymbol, highFunction);
 
-            final HighSymbol finalHighSymbol = highSymbol;
-            final Function finalFunction = func;
-            final HighFunction finalHighFunction = highFunction;
             AtomicBoolean successFlag = new AtomicBoolean(false);
 
+            // 事务在工作线程直接执行，无需 EDT（详见 renameFunction 注释）。
+            int tx = program.startTransaction("Rename variable");
             try {
-                SwingUtilities.invokeAndWait(() -> {
-                    int tx = program.startTransaction("Rename variable");
-                    try {
-                        if (commitRequired) {
-                            HighFunctionDBUtil.commitParamsToDatabase(finalHighFunction, false,
-                                ReturnCommitOption.NO_COMMIT, finalFunction.getSignatureSource());
-                        }
-                        HighFunctionDBUtil.updateDBVariable(
-                            finalHighSymbol,
-                            newVarName,
-                            null,
-                            SourceType.USER_DEFINED
-                        );
-                        successFlag.set(true);
-                    }
-                    catch (Exception e) {
-                        Msg.error(this, "Failed to rename variable", e);
-                    }
-                    finally {
-                        successFlag.set(program.endTransaction(tx, true));
-                    }
-                });
-            } catch (InterruptedException | InvocationTargetException e) {
-                String errorMsg = "Failed to execute rename on Swing thread: " + e.getMessage();
-                Msg.error(this, errorMsg, e);
-                return errorMsg;
+                if (commitRequired) {
+                    HighFunctionDBUtil.commitParamsToDatabase(highFunction, false,
+                        ReturnCommitOption.NO_COMMIT, func.getSignatureSource());
+                }
+                HighFunctionDBUtil.updateDBVariable(
+                    highSymbol,
+                    newVarName,
+                    null,
+                    SourceType.USER_DEFINED
+                );
+                successFlag.set(true);
+            }
+            catch (Exception e) {
+                Msg.error(this, "Failed to rename variable", e);
+            }
+            finally {
+                successFlag.set(program.endTransaction(tx, true));
             }
             return successFlag.get() ? "Variable renamed" : "Failed to rename variable";
         } finally {
@@ -874,6 +879,52 @@ public class GhidraMCPPlugin extends Plugin {
     }
 
     /**
+     * Find a function by exact name using the SymbolTable index.
+     *
+     * Replaces the previous {@code FunctionManager.getFunctions(true)} linear
+     * scan, which is O(N) over every function in the program (often tens of
+     * thousands). {@code SymbolTable.getSymbols(name)} is index-backed and
+     * essentially O(matches).
+     *
+     * @return the first matching {@link Function} (any namespace), or null.
+     */
+    private Function findFunctionByName(Program program, String name) {
+        if (program == null || name == null || name.isEmpty()) return null;
+        SymbolIterator it = program.getSymbolTable().getSymbols(name);
+        while (it.hasNext()) {
+            Symbol s = it.next();
+            if (s.getSymbolType() == SymbolType.FUNCTION) {
+                Object obj = s.getObject();
+                if (obj instanceof Function) {
+                    return (Function) obj;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Find all functions sharing the given exact name (any namespace).
+     * Index-backed via {@link SymbolTable#getSymbols(String)} — O(matches),
+     * not O(total functions).
+     */
+    private List<Function> findFunctionsByName(Program program, String name) {
+        List<Function> out = new ArrayList<>();
+        if (program == null || name == null || name.isEmpty()) return out;
+        SymbolIterator it = program.getSymbolTable().getSymbols(name);
+        while (it.hasNext()) {
+            Symbol s = it.next();
+            if (s.getSymbolType() == SymbolType.FUNCTION) {
+                Object obj = s.getObject();
+                if (obj instanceof Function) {
+                    out.add((Function) obj);
+                }
+            }
+        }
+        return out;
+    }
+
+    /**
      * Decompile a function at the given address
      */
     private String decompileFunctionByAddress(String addressStr) {
@@ -888,7 +939,7 @@ public class GhidraMCPPlugin extends Plugin {
             if (func == null) return "No function found at or containing address " + addressStr;
 
             decomp.openProgram(program);
-            DecompileResults result = decomp.decompileFunction(func, 30, new ConsoleTaskMonitor());
+            DecompileResults result = decomp.decompileFunction(func, decompileTimeoutSeconds, new ConsoleTaskMonitor());
 
             return (result != null && result.decompileCompleted())
                 ? result.getDecompiledFunction().getC()
@@ -949,21 +1000,16 @@ public class GhidraMCPPlugin extends Plugin {
 
         AtomicBoolean success = new AtomicBoolean(false);
 
+        // 事务在工作线程直接执行，无需 EDT（详见 renameFunction 注释）。
+        int tx = program.startTransaction(transactionName);
         try {
-            SwingUtilities.invokeAndWait(() -> {
-                int tx = program.startTransaction(transactionName);
-                try {
-                    Address addr = program.getAddressFactory().getAddress(addressStr);
-                    program.getListing().setComment(addr, commentType, comment);
-                    success.set(true);
-                } catch (Exception e) {
-                    Msg.error(this, "Error setting " + transactionName.toLowerCase(), e);
-                } finally {
-                    success.set(program.endTransaction(tx, success.get()));
-                }
-            });
-        } catch (InterruptedException | InvocationTargetException e) {
-            Msg.error(this, "Failed to execute " + transactionName.toLowerCase() + " on Swing thread", e);
+            Address addr = program.getAddressFactory().getAddress(addressStr);
+            program.getListing().setComment(addr, commentType, comment);
+            success.set(true);
+        } catch (Exception e) {
+            Msg.error(this, "Error setting comment", e);
+        } finally {
+            success.set(program.endTransaction(tx, success.get()));
         }
 
         return success.get();
@@ -1010,20 +1056,15 @@ public class GhidraMCPPlugin extends Plugin {
     private boolean renameFunctionByAddress(String functionAddrStr, String newName) {
         Program program = getCurrentProgram();
         if (program == null) return false;
-        if (functionAddrStr == null || functionAddrStr.isEmpty() || 
+        if (functionAddrStr == null || functionAddrStr.isEmpty() ||
             newName == null || newName.isEmpty()) {
             return false;
         }
 
         AtomicBoolean success = new AtomicBoolean(false);
 
-        try {
-            SwingUtilities.invokeAndWait(() -> {
-                performFunctionRename(program, functionAddrStr, newName, success);
-            });
-        } catch (InterruptedException | InvocationTargetException e) {
-            Msg.error(this, "Failed to execute rename function on Swing thread", e);
-        }
+        // 事务在工作线程直接执行，无需 EDT（详见 renameFunction 注释）。
+        performFunctionRename(program, functionAddrStr, newName, success);
 
         return success.get();
     }
@@ -1068,14 +1109,8 @@ public class GhidraMCPPlugin extends Plugin {
         final StringBuilder errorMessage = new StringBuilder();
         final AtomicBoolean success = new AtomicBoolean(false);
 
-        try {
-            SwingUtilities.invokeAndWait(() -> 
-                applyFunctionPrototype(program, functionAddrStr, prototype, success, errorMessage));
-        } catch (InterruptedException | InvocationTargetException e) {
-            String msg = "Failed to set function prototype on Swing thread: " + e.getMessage();
-            errorMessage.append(msg);
-            Msg.error(this, msg, e);
-        }
+        // 事务在工作线程直接执行，无需 EDT（详见 renameFunction 注释）。
+        applyFunctionPrototype(program, functionAddrStr, prototype, success, errorMessage);
 
         return new PrototypeResult(success.get(), errorMessage.toString());
     }
@@ -1197,12 +1232,8 @@ public class GhidraMCPPlugin extends Plugin {
 
         AtomicBoolean success = new AtomicBoolean(false);
 
-        try {
-            SwingUtilities.invokeAndWait(() -> 
-                applyVariableType(program, functionAddrStr, variableName, newType, success));
-        } catch (InterruptedException | InvocationTargetException e) {
-            Msg.error(this, "Failed to execute set variable type on Swing thread", e);
-        }
+        // 事务在工作线程直接执行，无需 EDT（详见 renameFunction 注释）。
+        applyVariableType(program, functionAddrStr, variableName, newType, success);
 
         return success.get();
     }
@@ -1299,7 +1330,7 @@ public class GhidraMCPPlugin extends Plugin {
         decomp.setSimplificationStyle("decompile"); // Full decompilation
 
         // Decompile the function
-        DecompileResults results = decomp.decompileFunction(func, 60, new ConsoleTaskMonitor());
+        DecompileResults results = decomp.decompileFunction(func, decompileTimeoutSeconds, new ConsoleTaskMonitor());
 
         if (!results.decompileCompleted()) {
             Msg.error(this, "Could not decompile function: " + results.getErrorMessage());
@@ -1414,21 +1445,21 @@ public class GhidraMCPPlugin extends Plugin {
         try {
             List<String> refs = new ArrayList<>();
             FunctionManager funcManager = program.getFunctionManager();
-            for (Function function : funcManager.getFunctions(true)) {
-                if (function.getName().equals(functionName)) {
-                    Address entryPoint = function.getEntryPoint();
-                    ReferenceIterator refIter = program.getReferenceManager().getReferencesTo(entryPoint);
-                    
-                    while (refIter.hasNext()) {
-                        Reference ref = refIter.next();
-                        Address fromAddr = ref.getFromAddress();
-                        RefType refType = ref.getReferenceType();
-                        
-                        Function fromFunc = funcManager.getFunctionContaining(fromAddr);
-                        String funcInfo = (fromFunc != null) ? " in " + fromFunc.getName() : "";
-                        
-                        refs.add(String.format("From %s%s [%s]", fromAddr, funcInfo, refType.getName()));
-                    }
+            // 用 SymbolTable 索引按名查找（O(matches)），替代原 O(N) 全函数扫描。
+            // 保留原语义：处理同名函数有多个的情况。
+            for (Function function : findFunctionsByName(program, functionName)) {
+                Address entryPoint = function.getEntryPoint();
+                ReferenceIterator refIter = program.getReferenceManager().getReferencesTo(entryPoint);
+
+                while (refIter.hasNext()) {
+                    Reference ref = refIter.next();
+                    Address fromAddr = ref.getFromAddress();
+                    RefType refType = ref.getReferenceType();
+
+                    Function fromFunc = funcManager.getFunctionContaining(fromAddr);
+                    String funcInfo = (fromFunc != null) ? " in " + fromFunc.getName() : "";
+
+                    refs.add(String.format("From %s%s [%s]", fromAddr, funcInfo, refType.getName()));
                 }
             }
             
@@ -2214,18 +2245,17 @@ public class GhidraMCPPlugin extends Plugin {
             java.util.concurrent.atomic.AtomicReference<String> errorMsg =
                 new java.util.concurrent.atomic.AtomicReference<>("");
 
-            SwingUtilities.invokeAndWait(() -> {
-                int tx = program.startTransaction("Set calling convention");
-                try {
-                    func.setCallingConvention(convention);
-                    success.set(true);
-                } catch (Exception e) {
-                    errorMsg.set(e.getMessage());
-                    Msg.error(this, "Error setting calling convention", e);
-                } finally {
-                    program.endTransaction(tx, success.get());
-                }
-            });
+            // 事务在工作线程直接执行，无需 EDT（详见 renameFunction 注释）。
+            int tx = program.startTransaction("Set calling convention");
+            try {
+                func.setCallingConvention(convention);
+                success.set(true);
+            } catch (Exception e) {
+                errorMsg.set(e.getMessage());
+                Msg.error(this, "Error setting calling convention", e);
+            } finally {
+                program.endTransaction(tx, success.get());
+            }
 
             return success.get()
                 ? String.format("Calling convention set to \"%s\"", convention)
@@ -2233,6 +2263,36 @@ public class GhidraMCPPlugin extends Plugin {
         } catch (Exception e) {
             return "Error setting calling convention: " + e.getMessage();
         }
+    }
+
+    // ----------------------------------------------------------------------------------
+    // Runtime configuration helpers
+    // ----------------------------------------------------------------------------------
+
+    /**
+     * Update the per-call decompile timeout (seconds). Validates input and reports the
+     * old / new value back to the caller (LLM-friendly text).
+     *
+     * Note: the corresponding Tool Option is NOT modified — this change lives until
+     * Ghidra restart / plugin reload. Persisted default still comes from Tool Options.
+     */
+    private String setDecompileTimeoutSeconds(String secondsStr) {
+        if (secondsStr == null || secondsStr.isEmpty()) {
+            return "Error: 'seconds' parameter is required";
+        }
+        int newValue;
+        try {
+            newValue = Integer.parseInt(secondsStr.trim());
+        } catch (NumberFormatException e) {
+            return "Error: invalid integer '" + secondsStr + "'";
+        }
+        if (newValue <= 0) {
+            return "Error: 'seconds' must be > 0 (got " + newValue + ")";
+        }
+        int old = decompileTimeoutSeconds;
+        decompileTimeoutSeconds = newValue;
+        Msg.info(this, "Decompile timeout updated: " + old + "s -> " + newValue + "s");
+        return "Decompile timeout updated: " + old + "s -> " + newValue + "s";
     }
 
     // ----------------------------------------------------------------------------------
@@ -2353,6 +2413,12 @@ public class GhidraMCPPlugin extends Plugin {
             server.stop(1); // Stop with a small delay (e.g., 1 second) for connections to finish
             server = null; // Nullify the reference
             Msg.info(this, "GhidraMCP HTTP server stopped.");
+        }
+        if (httpExecutor != null) {
+            // 关掉 4 线程池，避免 plugin reload 时线程泄漏。
+            // 已经被 server.stop() 通知过的 handler 应该已经走完，这里 shutdownNow 兜底中断剩余任务。
+            httpExecutor.shutdownNow();
+            httpExecutor = null;
         }
         super.dispose();
     }

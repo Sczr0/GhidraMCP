@@ -467,6 +467,40 @@ def set_http_timeout(seconds: int) -> str:
     http_timeout = new_timeout
     return f"HTTP timeout updated: {old_timeout}s -> {new_timeout}s"
 
+@mcp.tool()
+def get_decompile_timeout() -> str:
+    """
+    Get the current Ghidra-side decompile timeout (in seconds). This is the
+    per-function timeout passed to the Ghidra decompiler, separate from the
+    HTTP request timeout (see get_http_timeout / set_http_timeout).
+    """
+    return safe_post("getDecompileTimeout", "")
+
+@mcp.tool()
+def set_decompile_timeout(seconds: int) -> str:
+    """
+    Set the Ghidra-side decompile timeout (in seconds). This controls how long
+    the Ghidra decompiler is allowed to spend on a single function before
+    giving up. Increase this for very large or heavily obfuscated functions
+    that fail with "Decompilation failed".
+
+    IMPORTANT: This is independent from the HTTP request timeout. For the new
+    value to actually take effect, ensure the HTTP timeout is at least this
+    large plus a small buffer for network/serialization, otherwise the HTTP
+    client will time out first. Use set_http_timeout(seconds + 10) or larger
+    when bumping this value.
+
+    Args:
+        seconds: New decompile timeout in seconds. Must be a positive integer.
+    """
+    try:
+        new_timeout = int(seconds)
+    except (TypeError, ValueError):
+        return f"Invalid timeout value: {seconds!r} (must be a positive integer)"
+    if new_timeout <= 0:
+        return f"Invalid timeout value: {new_timeout} (must be > 0)"
+    return safe_post("setDecompileTimeout", {"seconds": str(new_timeout)})
+
 
 def main():
     parser = argparse.ArgumentParser(description="MCP server for Ghidra")
