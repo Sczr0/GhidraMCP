@@ -15,6 +15,7 @@ from urllib.parse import urljoin
 from mcp.server.fastmcp import FastMCP
 
 DEFAULT_GHIDRA_SERVER = "http://127.0.0.1:8080/"
+DEFAULT_HTTP_TIMEOUT = 60  # seconds; override via --http-timeout CLI flag or set_http_timeout MCP tool
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,10 @@ mcp = FastMCP("ghidra-mcp")
 
 # Initialize ghidra_server_url with default value
 ghidra_server_url = DEFAULT_GHIDRA_SERVER
+# Shared HTTP timeout (seconds) used by every safe_get / safe_post call.
+# Adjustable at runtime via the set_http_timeout MCP tool so the LLM can raise
+# it when analysing huge functions (CFG / dominator tree / decompile, etc.).
+http_timeout = DEFAULT_HTTP_TIMEOUT
 
 def safe_get(endpoint: str, params: dict = None) -> list:
     """
@@ -33,7 +38,7 @@ def safe_get(endpoint: str, params: dict = None) -> list:
     url = urljoin(ghidra_server_url, endpoint)
 
     try:
-        response = requests.get(url, params=params, timeout=5)
+        response = requests.get(url, params=params, timeout=http_timeout)
         response.encoding = 'utf-8'
         if response.ok:
             return response.text.splitlines()
@@ -46,9 +51,9 @@ def safe_post(endpoint: str, data: dict | str) -> str:
     try:
         url = urljoin(ghidra_server_url, endpoint)
         if isinstance(data, dict):
-            response = requests.post(url, data=data, timeout=5)
+            response = requests.post(url, data=data, timeout=http_timeout)
         else:
-            response = requests.post(url, data=data.encode("utf-8"), timeout=5)
+            response = requests.post(url, data=data.encode("utf-8"), timeout=http_timeout)
         response.encoding = 'utf-8'
         if response.ok:
             return response.text.strip()
@@ -430,6 +435,39 @@ def set_calling_convention(address: str, convention: str) -> str:
                       {"address": address, "convention": convention})
 
 
+# ---- Runtime configuration tools ----
+
+@mcp.tool()
+def get_http_timeout() -> str:
+    """
+    Get the current HTTP timeout (in seconds) used for every request to the
+    Ghidra HTTP server.
+    """
+    return f"{http_timeout}"
+
+@mcp.tool()
+def set_http_timeout(seconds: int) -> str:
+    """
+    Set the HTTP timeout (in seconds) used for every request to the Ghidra
+    HTTP server. Increase this when analysing very large functions so that
+    heavy tools (decompile_function, get_basic_blocks, get_control_flow_graph,
+    get_dominator_tree, ...) do not time out.
+
+    Args:
+        seconds: New timeout in seconds. Must be a positive integer.
+    """
+    global http_timeout
+    try:
+        new_timeout = int(seconds)
+    except (TypeError, ValueError):
+        return f"Invalid timeout value: {seconds!r} (must be a positive integer)"
+    if new_timeout <= 0:
+        return f"Invalid timeout value: {new_timeout} (must be > 0)"
+    old_timeout = http_timeout
+    http_timeout = new_timeout
+    return f"HTTP timeout updated: {old_timeout}s -> {new_timeout}s"
+
+
 def main():
     parser = argparse.ArgumentParser(description="MCP server for Ghidra")
     parser.add_argument("--ghidra-server", type=str, default=DEFAULT_GHIDRA_SERVER,
@@ -440,12 +478,23 @@ def main():
                         help="Port to run MCP server on (only used for sse), default: 8081")
     parser.add_argument("--transport", type=str, default="stdio", choices=["stdio", "sse"],
                         help="Transport protocol for MCP, default: stdio")
+    parser.add_argument("--http-timeout", type=int, default=DEFAULT_HTTP_TIMEOUT,
+                        help=f"HTTP timeout in seconds for requests to the Ghidra server, "
+                             f"default: {DEFAULT_HTTP_TIMEOUT}. Increase this when analysing "
+                             f"very large functions. Can also be adjusted at runtime via the "
+                             f"set_http_timeout MCP tool.")
     args = parser.parse_args()
-    
+
     # Use the global variable to ensure it's properly updated
     global ghidra_server_url
     if args.ghidra_server:
         ghidra_server_url = args.ghidra_server
+
+    global http_timeout
+    if args.http_timeout is not None:
+        if args.http_timeout <= 0:
+            parser.error(f"--http-timeout must be > 0 (got {args.http_timeout})")
+        http_timeout = args.http_timeout
     
     if args.transport == "sse":
         try:
