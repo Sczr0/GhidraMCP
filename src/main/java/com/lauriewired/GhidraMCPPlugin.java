@@ -18,6 +18,7 @@ import ghidra.program.model.pcode.HighFunctionDBUtil;
 import ghidra.program.model.pcode.HighFunctionDBUtil.ReturnCommitOption;
 import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileResults;
+import ghidra.app.DeveloperPluginPackage;
 import ghidra.app.plugin.PluginCategoryNames;
 import ghidra.app.services.CodeViewerService;
 import ghidra.app.services.ProgramManager;
@@ -66,7 +67,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 @PluginInfo(
     status = PluginStatus.RELEASED,
-    packageName = "GhidraMCP",
+    packageName = DeveloperPluginPackage.NAME,
     category = PluginCategoryNames.ANALYSIS,
     shortDescription = "HTTP server plugin",
     description = "Starts an embedded HTTP server to expose program data. Port configurable via Tool Options."
@@ -414,15 +415,11 @@ public class GhidraMCPPlugin extends Plugin {
         });
 
         server.setExecutor(null);
-        new Thread(() -> {
-            try {
-                server.start();
-                Msg.info(this, "GhidraMCP HTTP server started on port " + port);
-            } catch (Exception e) {
-                Msg.error(this, "Failed to start HTTP server on port " + port + ". Port might be in use.", e);
-                server = null; // Ensure server isn't considered running
-            }
-        }, "GhidraMCP-HTTP-Server").start();
+        // HttpServer.start() 是非阻塞的，内部会派生 daemon 监听线程；
+        // 端口冲突等 IOException 已在前面的 HttpServer.create() 抛出，
+        // 由 startServer() throws + 构造器 catch 统一处理，无需额外包装线程。
+        server.start();
+        Msg.info(this, "GhidraMCP HTTP server started on port " + port);
     }
 
     // ----------------------------------------------------------------------------------
