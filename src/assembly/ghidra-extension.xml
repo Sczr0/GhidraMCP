@@ -16,12 +16,15 @@
     <includeBaseDirectory>false</includeBaseDirectory>
     
     <fileSets>
-        <!-- 1) Copy extension.properties and Module.manifest into the top level 
-               of a folder named GhidraMCP/ (the actual extension folder). -->
+        <!-- 1) Copy extension.properties and Module.manifest into the top level
+               of a folder named GhidraMCP/ (the actual extension folder).
+               Module.manifest 是 Ghidra 识别扩展模块的关键文件，
+               缺失会导致扩展安装后无法在 Configure 中勾选启用。 -->
         <fileSet>
             <directory>src/main/resources</directory>
             <includes>
                 <include>extension.properties</include>
+                <include>Module.manifest</include>
             </includes>
             <outputDirectory>GhidraMCP</outputDirectory>
         </fileSet>
